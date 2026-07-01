@@ -160,9 +160,9 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
             os.unlink(tmp.name)
 
     def _confirm_accept(self, filename, src_host):
-        print(f"\nreceived from {src_host}: {filename}", end='')
+        print(f"received from {src_host}: {filename}")
         try:
-            answer = input(f"\nAccept '{filename}' from {src_host}? [y/N]: ").strip().lower()
+            answer = input(f"Accept '{filename}' from {src_host}? [y/N]: ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             print()
             return False
@@ -189,6 +189,9 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
             except (EOFError, KeyboardInterrupt):
                 print()
                 return 'reject', None
+            if not answer:
+                print("  name can't be empty")
+                continue
             if answer == filename:
                 print("  name unchanged, choose another")
                 continue
@@ -198,7 +201,7 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
             return 'rename', answer
 
     def log_message(self, fmt, *args):
-        print(f"[{self.address_string()}] {fmt % args}")
+        pass
 
 
 class ReusableTCPServer(socketserver.ThreadingTCPServer):
