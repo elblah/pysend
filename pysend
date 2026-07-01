@@ -175,7 +175,9 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
                 os.unlink(tmp.name)
                 items = os.listdir(tmp_dir)
                 if items:
-                    incoming = os.path.join(tmp_dir, items[0])
+                    src = os.path.join(tmp_dir, items[0])
+                    incoming = os.path.join(tmp_dir, 'incoming')
+                    os.rename(src, incoming)
                     subprocess.run(['diff', '-rq', filename, incoming])
                 else:
                     print("  (empty archive)")
