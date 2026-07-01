@@ -131,6 +131,12 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
                 if final is None:
                     print(f"  rejected ({filename})")
                     return
+                # remove existing dir for ! overwrite
+                if os.path.exists(final):
+                    if os.path.isdir(final):
+                        shutil.rmtree(final)
+                    else:
+                        os.unlink(final)
                 shutil.move(extracted, final)
                 print(f"saved: {final}/")
             finally:
@@ -147,19 +153,24 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
                 raise
 
             if answer == '?' or answer == 'help':
-                print("  ! or .  reject this file")
-                print("  Enter   accept suggested name")
-                print("  <name>  save as <name>")
+                print("  ! or .    reject this file")
+                print("  Enter     accept suggested name")
+                print("  <name>    save as <name>")
+                print("  !<name>   save as <name> (overwrite if exists)")
                 continue
 
             if answer == '!' or answer == '.':
-                return None
+                return None  # reject
+
+            force = answer.startswith('!')
+            if force:
+                answer = answer[1:].strip()
 
             if not answer:
                 answer = suggested
 
-            if os.path.exists(answer):
-                print(f"  {answer} already exists, choose another name")
+            if not force and os.path.exists(answer):
+                print(f"  {answer} already exists, use !{answer} to overwrite")
                 continue
 
             return answer
