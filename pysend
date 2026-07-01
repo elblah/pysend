@@ -106,7 +106,7 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
             print(f"  error processing upload from {src_host}: {e}")
 
     def _save_file(self, data, filename, src_host):
-        if not self._confirm_accept(filename, src_host):
+        if not self._confirm_accept(data, filename, 'file', src_host):
             return
         if os.path.exists(filename):
             action, name = self._handle_conflict(filename)
@@ -121,7 +121,7 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
         print(f"saved: {name}")
 
     def _save_directory(self, data, filename, src_host):
-        if not self._confirm_accept(filename, src_host):
+        if not self._confirm_accept(data, filename, 'directory', src_host):
             return
 
         tmp = tempfile.NamedTemporaryFile(suffix='.tar', delete=False)
@@ -142,7 +142,6 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
                     return
 
                 extracted = os.path.join(extract_dir, items[0])
-                name = filename
                 if os.path.exists(name):
                     action, name = self._handle_conflict(filename)
                     if action == 'reject':
@@ -159,17 +158,55 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
         finally:
             os.unlink(tmp.name)
 
-    def _confirm_accept(self, filename, src_host):
-        print(f"received from {src_host}: {filename}")
+    def _show_diff(self, data, filename, filetype):
+        if not os.path.exists(filename):
+            print(f"  (no local '{filename}' to compare)")
+            return
+        tmp_data = None
+        tmp_dir = None
         try:
-            answer = input(f"Accept '{filename}' from {src_host}? [y/N]: ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return False
-        if answer in ('y', 'yes'):
-            return True
-        print(f"  rejected ({filename})")
-        return False
+            if filetype == 'directory':
+                tmp = tempfile.NamedTemporaryFile(suffix='.tar', delete=False)
+                tmp.write(data)
+                tmp.close()
+                tmp_dir = tempfile.mkdtemp()
+                subprocess.run(['tar', 'xf', tmp.name, '-C', tmp_dir],
+                           check=True, capture_output=True)
+                os.unlink(tmp.name)
+                items = os.listdir(tmp_dir)
+                if items:
+                    incoming = os.path.join(tmp_dir, items[0])
+                    subprocess.run(['diff', '-rq', filename, incoming])
+                else:
+                    print("  (empty archive)")
+            else:
+                tmp_data = tempfile.NamedTemporaryFile(delete=False)
+                tmp_data.write(data)
+                tmp_data.close()
+                subprocess.run(['diff', '-q', filename, tmp_data.name])
+        finally:
+            if tmp_data:
+                os.unlink(tmp_data.name)
+            if tmp_dir:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def _confirm_accept(self, data, filename, filetype, src_host):
+        print(f"received from {src_host}: {filename}")
+        while True:
+            try:
+                answer = input(f"Accept '{filename}' from {src_host}? [y/N/diff]: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return False
+            if answer in ('y', 'yes'):
+                return True
+            if answer in ('', 'n', 'no'):
+                print(f"  rejected ({filename})")
+                return False
+            if answer == 'diff':
+                self._show_diff(data, filename, filetype)
+                continue
+            print("  y = accept, N = reject, diff = compare with local")
 
     def _handle_conflict(self, filename):
         print(f"  '{filename}' already exists")
