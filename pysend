@@ -124,6 +124,8 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
         if not self._confirm_accept(data, filename, 'directory', src_host):
             return
 
+        name = filename
+
         tmp = tempfile.NamedTemporaryFile(suffix='.tar', delete=False)
         try:
             tmp.write(data)
