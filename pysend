@@ -12,6 +12,15 @@ import socketserver
 import threading
 import urllib.request
 import urllib.error
+import readline
+
+
+def rlinput(prompt, prefill=''):
+    readline.set_startup_hook(lambda: readline.insert_text(prefill))
+    try:
+        return input(prompt)
+    finally:
+        readline.set_startup_hook()
 
 
 def send(path, host, port):
@@ -97,17 +106,23 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
             print(f"  error processing upload from {src_host}: {e}")
 
     def _save_file(self, data, filename, src_host):
-        print(f"\nreceived from {src_host}: {filename} ({len(data)} bytes)")
-        final = self._prompt_name(filename, src_host)
-        if final is None:
-            print(f"  rejected ({filename})")
+        if not self._confirm_accept(filename, src_host):
             return
-        with open(final, 'wb') as f:
+        if os.path.exists(filename):
+            action, name = self._handle_conflict(filename)
+            if action == 'reject':
+                return
+            if action == 'rename':
+                filename = name
+        else:
+            name = filename
+        with open(name, 'wb') as f:
             f.write(data)
-        print(f"saved: {final}")
+        print(f"saved: {name}")
 
     def _save_directory(self, data, filename, src_host):
-        print(f"\nreceived from {src_host}: {filename} ({len(data)} bytes)")
+        if not self._confirm_accept(filename, src_host):
+            return
 
         tmp = tempfile.NamedTemporaryFile(suffix='.tar', delete=False)
         try:
@@ -127,53 +142,60 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
                     return
 
                 extracted = os.path.join(extract_dir, items[0])
-                final = self._prompt_name(filename, src_host)
-                if final is None:
-                    print(f"  rejected ({filename})")
-                    return
-                # remove existing dir for ! overwrite
-                if os.path.exists(final):
-                    if os.path.isdir(final):
-                        shutil.rmtree(final)
+                name = filename
+                if os.path.exists(name):
+                    action, name = self._handle_conflict(filename)
+                    if action == 'reject':
+                        return
+                if os.path.exists(name):
+                    if os.path.isdir(name):
+                        shutil.rmtree(name)
                     else:
-                        os.unlink(final)
-                shutil.move(extracted, final)
-                print(f"saved: {final}/")
+                        os.unlink(name)
+                shutil.move(extracted, name)
+                print(f"saved: {name}/")
             finally:
                 shutil.rmtree(extract_dir, ignore_errors=True)
         finally:
             os.unlink(tmp.name)
 
-    def _prompt_name(self, suggested, src_host):
+    def _confirm_accept(self, filename, src_host):
+        print(f"\nreceived from {src_host}: {filename}", end='')
+        try:
+            answer = input(f"\nAccept '{filename}' from {src_host}? [y/N]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return False
+        if answer in ('y', 'yes'):
+            return True
+        print(f"  rejected ({filename})")
+        return False
+
+    def _handle_conflict(self, filename):
+        print(f"  '{filename}' already exists")
         while True:
             try:
-                answer = input(f"save as [{suggested}] (from {src_host}): ").strip()
+                answer = input(f"Overwrite '{filename}'? [y/N]: ").strip().lower()
             except (EOFError, KeyboardInterrupt):
                 print()
-                raise
-
-            if answer == '?' or answer == 'help':
-                print("  ! or .    reject this file")
-                print("  Enter     accept suggested name")
-                print("  <name>    save as <name>")
-                print("  !<name>   save as <name> (overwrite if exists)")
+                return 'reject', None
+            if answer in ('y', 'yes'):
+                return 'overwrite', filename
+            if answer in ('', 'n', 'no'):
+                break
+        while True:
+            try:
+                answer = rlinput("Rename: ", filename).strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return 'reject', None
+            if answer == filename:
+                print("  name unchanged, choose another")
                 continue
-
-            if answer == '!' or answer == '.':
-                return None  # reject
-
-            force = answer.startswith('!')
-            if force:
-                answer = answer[1:].strip()
-
-            if not answer:
-                answer = suggested
-
-            if not force and os.path.exists(answer):
-                print(f"  {answer} already exists, use !{answer} to overwrite")
+            if os.path.exists(answer):
+                print(f"  '{answer}' already exists")
                 continue
-
-            return answer
+            return 'rename', answer
 
     def log_message(self, fmt, *args):
         print(f"[{self.address_string()}] {fmt % args}")
