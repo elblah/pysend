@@ -97,14 +97,17 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
             print(f"  error processing upload from {src_host}: {e}")
 
     def _save_file(self, data, filename, src_host):
-        print(f"\nfile received from {src_host}: {filename} ({len(data)} bytes)")
-        final = self._prompt_name(filename)
+        print(f"\nreceived from {src_host}: {filename} ({len(data)} bytes)")
+        final = self._prompt_name(filename, src_host)
+        if final is None:
+            print(f"  rejected ({filename})")
+            return
         with open(final, 'wb') as f:
             f.write(data)
         print(f"saved: {final}")
 
     def _save_directory(self, data, filename, src_host):
-        print(f"\ndirectory received from {src_host}: {filename} ({len(data)} bytes)")
+        print(f"\nreceived from {src_host}: {filename} ({len(data)} bytes)")
 
         tmp = tempfile.NamedTemporaryFile(suffix='.tar', delete=False)
         try:
@@ -124,7 +127,10 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
                     return
 
                 extracted = os.path.join(extract_dir, items[0])
-                final = self._prompt_name(filename)
+                final = self._prompt_name(filename, src_host)
+                if final is None:
+                    print(f"  rejected ({filename})")
+                    return
                 shutil.move(extracted, final)
                 print(f"saved: {final}/")
             finally:
@@ -132,13 +138,16 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
         finally:
             os.unlink(tmp.name)
 
-    def _prompt_name(self, suggested):
+    def _prompt_name(self, suggested, src_host):
         while True:
             try:
-                answer = input(f"save as [{suggested}]: ").strip()
+                answer = input(f"save as [{suggested}] (from {src_host}): ").strip()
             except (EOFError, KeyboardInterrupt):
                 print()
                 raise
+
+            if answer == '!' or answer == '.':
+                return None
 
             if not answer:
                 answer = suggested
