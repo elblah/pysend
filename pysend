@@ -160,7 +160,7 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
         finally:
             os.unlink(tmp.name)
 
-    def _show_diff(self, data, filename, filetype):
+    def _show_diff(self, data, filename, filetype, brief=True):
         if not os.path.exists(filename):
             print(f"  (no local '{filename}' to compare)")
             return
@@ -180,14 +180,16 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
                     src = os.path.join(tmp_dir, items[0])
                     incoming = os.path.join(tmp_dir, 'incoming')
                     os.rename(src, incoming)
-                    subprocess.run(['diff', '-rq', filename, incoming])
+                    subprocess.run(['diff', '-rq', filename, incoming] if brief
+                               else ['diff', '-r', filename, incoming])
                 else:
                     print("  (empty archive)")
             else:
                 tmp_data = tempfile.NamedTemporaryFile(delete=False)
                 tmp_data.write(data)
                 tmp_data.close()
-                subprocess.run(['diff', '-q', filename, tmp_data.name])
+                subprocess.run(['diff', '-q', filename, tmp_data.name] if brief
+                           else ['diff', filename, tmp_data.name])
         finally:
             if tmp_data:
                 os.unlink(tmp_data.name)
@@ -198,7 +200,7 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
         print(f"received from {src_host}: {filename}")
         while True:
             try:
-                answer = input(f"Accept '{filename}' from {src_host}? [y/N/diff]: ").strip().lower()
+                answer = input(f"Accept '{filename}' from {src_host}? [y/N/diff/!diff]: ").strip().lower()
             except (EOFError, KeyboardInterrupt):
                 print()
                 return False
@@ -208,9 +210,12 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
                 print(f"  rejected ({filename})")
                 return False
             if answer == 'diff':
-                self._show_diff(data, filename, filetype)
+                self._show_diff(data, filename, filetype, brief=True)
                 continue
-            print("  y = accept, N = reject, diff = compare with local")
+            if answer == '!diff':
+                self._show_diff(data, filename, filetype, brief=False)
+                continue
+            print("  y = accept, N = reject, diff = summary, !diff = full diff")
 
     def _handle_conflict(self, filename):
         print(f"  '{filename}' already exists")
