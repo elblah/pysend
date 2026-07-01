@@ -247,11 +247,14 @@ class ReusableTCPServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
 
 
-def receive(port):
+def receive(port, tmpdir):
     """Start the receiving HTTP server."""
     host = '0.0.0.0'
+    os.makedirs(tmpdir, exist_ok=True)
+    tempfile.tempdir = os.path.abspath(tmpdir)
     server = ReusableTCPServer((host, port), UploadHandler)
     print(f"pysend receive listening on http://{host}:{port}")
+    print(f"temp dir: {tempfile.tempdir}")
     print("send files:  pysend send <file|dir>")
     print()
     try:
@@ -269,10 +272,12 @@ def main():
                         help='port (env: PYSEND_PORT, default: 8001)')
     parser.add_argument('--host', default=os.environ.get('PYSEND_HOST', 'localhost'),
                         help='server host for send (env: PYSEND_HOST, default: localhost)')
+    parser.add_argument('--tmpdir', default=os.environ.get('PYSEND_TMPDIR', '.tmp'),
+                        help='temp dir for receive (env: PYSEND_TMPDIR, default: .tmp)')
     args = parser.parse_args()
 
     if args.action == 'receive':
-        receive(args.port)
+        receive(args.port, args.tmpdir)
     elif args.action == 'send':
         if not args.path:
             print("error: path required for 'send'", file=sys.stderr)
