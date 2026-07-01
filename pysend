@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+"""pysend - transfer files/dirs over HTTP with interactive receive prompt."""
+
+import sys
+import os
+import argparse
+import subprocess
+import tempfile
+import shutil
+import http.server
+import socketserver
+import threading
+import urllib.request
+import urllib.error
+
+
+def send(path, host, port):
+    """Send a file or directory to the receiving server."""
+    path = os.path.abspath(path)
+    if not os.path.exists(path):
+        print(f"error: {path}: no such file or directory", file=sys.stderr)
+        sys.exit(1)
+
+    name = os.path.basename(path)
+    is_dir = os.path.isdir(path)
+
+    if is_dir:
+        data = subprocess.run(
+            ['tar', 'cf', '-', '-C', os.path.dirname(path), name],
+            check=True, capture_output=True
+        ).stdout
+        filetype = 'directory'
+    else:
+        with open(path, 'rb') as f:
+            data = f.read()
+        filetype = 'file'
+
+    url = f'http://{host}:{port}/upload'
+    req = urllib.request.Request(
+        url, data=data,
+        headers={
+            'X-Filename': name,
+            'X-FileType': filetype,
+            'Content-Type': 'application/octet-stream',
+        },
+        method='POST'
+    )
+
+    try:
+        with urllib.request.urlopen(req) as resp:
+            print(f"sent {path} -> {url}")
+            print(resp.read().decode().strip())
+    except urllib.error.URLError as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+class UploadHandler(http.server.BaseHTTPRequestHandler):
+    """HTTP handler that receives file uploads with interactive naming."""
+
+    def do_POST(self):
+        if self.path != '/upload':
+            self.send_error(404)
+            return
+
+        filename = self.headers.get('X-Filename')
+        filetype = self.headers.get('X-FileType', 'file')
+
+        if not filename:
+            self.send_error(400, "missing X-Filename header")
+            return
+
+        filename = os.path.basename(filename)
+
+        length = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(length)
+
+        t = threading.Thread(
+            target=self._process_upload,
+            args=(body, filename, filetype),
+            daemon=True,
+        )
+        t.start()
+
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"ok\n")
+
+    def _process_upload(self, data, filename, filetype):
+        src_host = self.client_address[0]
+        try:
+            if filetype == 'directory':
+                self._save_directory(data, filename, src_host)
+            else:
+                self._save_file(data, filename, src_host)
+        except Exception as e:
+            print(f"  error processing upload from {src_host}: {e}")
+
+    def _save_file(self, data, filename, src_host):
+        print(f"\nfile received from {src_host}: {filename} ({len(data)} bytes)")
+        final = self._prompt_name(filename)
+        with open(final, 'wb') as f:
+            f.write(data)
+        print(f"saved: {final}")
+
+    def _save_directory(self, data, filename, src_host):
+        print(f"\ndirectory received from {src_host}: {filename} ({len(data)} bytes)")
+
+        tmp = tempfile.NamedTemporaryFile(suffix='.tar', delete=False)
+        try:
+            tmp.write(data)
+            tmp.close()
+
+            extract_dir = tempfile.mkdtemp()
+            try:
+                subprocess.run(
+                    ['tar', 'xf', tmp.name, '-C', extract_dir],
+                    check=True, capture_output=True
+                )
+
+                items = os.listdir(extract_dir)
+                if not items:
+                    print("  error: tar archive is empty", file=sys.stderr)
+                    return
+
+                extracted = os.path.join(extract_dir, items[0])
+                final = self._prompt_name(filename)
+                shutil.move(extracted, final)
+                print(f"saved: {final}/")
+            finally:
+                shutil.rmtree(extract_dir, ignore_errors=True)
+        finally:
+            os.unlink(tmp.name)
+
+    def _prompt_name(self, suggested):
+        while True:
+            try:
+                answer = input(f"save as [{suggested}]: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                raise
+
+            if not answer:
+                answer = suggested
+
+            if os.path.exists(answer):
+                print(f"  {answer} already exists, choose another name")
+                continue
+
+            return answer
+
+    def log_message(self, fmt, *args):
+        print(f"[{self.address_string()}] {fmt % args}")
+
+
+class ReusableTCPServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+
+
+def receive(port):
+    """Start the receiving HTTP server."""
+    host = '0.0.0.0'
+    server = ReusableTCPServer((host, port), UploadHandler)
+    print(f"pysend receive listening on http://{host}:{port}")
+    print("send files:  pysend send <file|dir>")
+    print()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nshutting down...")
+        server.shutdown()
+
+
+def main():
+    parser = argparse.ArgumentParser(description='pysend - transfer files over HTTP')
+    parser.add_argument('action', choices=['send', 'receive'])
+    parser.add_argument('path', nargs='?', help='file or directory to send')
+    parser.add_argument('--port', type=int, default=int(os.environ.get('PYSEND_PORT', '8001')),
+                        help='port (env: PYSEND_PORT, default: 8001)')
+    parser.add_argument('--host', default=os.environ.get('PYSEND_HOST', 'localhost'),
+                        help='server host for send (env: PYSEND_HOST, default: localhost)')
+    args = parser.parse_args()
+
+    if args.action == 'receive':
+        receive(args.port)
+    elif args.action == 'send':
+        if not args.path:
+            print("error: path required for 'send'", file=sys.stderr)
+            sys.exit(1)
+        send(args.path, args.host, args.port)
+
+
+if __name__ == '__main__':
+    main()
