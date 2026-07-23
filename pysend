@@ -23,8 +23,152 @@ def rlinput(prompt, prefill=''):
         readline.set_startup_hook()
 
 
-def send(path, host, port):
-    """Send a file or directory to the receiving server."""
+def _show_diff(data, filename, filetype, brief=True):
+    if not os.path.exists(filename):
+        print(f"  (no local '{filename}' to compare)")
+        return
+    tmp_data = None
+    tmp_dir = None
+    try:
+        if filetype == 'directory':
+            tmp = tempfile.NamedTemporaryFile(suffix='.tar', delete=False)
+            tmp.write(data)
+            tmp.close()
+            tmp_dir = tempfile.mkdtemp()
+            subprocess.run(['tar', 'xf', tmp.name, '-C', tmp_dir],
+                           check=True, capture_output=True)
+            os.unlink(tmp.name)
+            items = os.listdir(tmp_dir)
+            if items:
+                src = os.path.join(tmp_dir, items[0])
+                incoming = os.path.join(tmp_dir, 'incoming')
+                os.rename(src, incoming)
+                subprocess.run(['diff', '-rq', filename, incoming] if brief
+                               else ['diff', '-r', filename, incoming])
+            else:
+                print("  (empty archive)")
+        else:
+            tmp_data = tempfile.NamedTemporaryFile(delete=False)
+            tmp_data.write(data)
+            tmp_data.close()
+            subprocess.run(['diff', '-q', filename, tmp_data.name] if brief
+                           else ['diff', filename, tmp_data.name])
+    finally:
+        if tmp_data:
+            os.unlink(tmp_data.name)
+        if tmp_dir:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _confirm_accept(data, filename, filetype, src_host):
+    print(f"received from {src_host}: {filename}")
+    while True:
+        try:
+            answer = input(f"Accept '{filename}' from {src_host}? [y/N/diff/!diff]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return False
+        if answer in ('y', 'yes'):
+            return True
+        if answer in ('', 'n', 'no'):
+            print(f"  rejected ({filename})")
+            return False
+        if answer == 'diff':
+            _show_diff(data, filename, filetype, brief=True)
+            continue
+        if answer == '!diff':
+            _show_diff(data, filename, filetype, brief=False)
+            continue
+        print("  y = accept, N = reject, diff = summary, !diff = full diff")
+
+
+def _handle_conflict(filename):
+    print(f"  '{filename}' already exists")
+    while True:
+        try:
+            answer = input(f"Overwrite '{filename}'? [y/N]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 'reject', None
+        if answer in ('y', 'yes'):
+            return 'overwrite', filename
+        if answer in ('', 'n', 'no'):
+            break
+    while True:
+        try:
+            answer = rlinput("Rename: ", filename).strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 'reject', None
+        if not answer:
+            print("  name can't be empty")
+            continue
+        if answer == filename:
+            print("  name unchanged, choose another")
+            continue
+        if os.path.exists(answer):
+            print(f"  '{answer}' already exists")
+            continue
+        return 'rename', answer
+
+
+def _save_file(data, filename, src_host):
+    if not _confirm_accept(data, filename, 'file', src_host):
+        return
+    if os.path.exists(filename):
+        action, name = _handle_conflict(filename)
+        if action == 'reject':
+            return
+        if action == 'rename':
+            filename = name
+    with open(filename, 'wb') as f:
+        f.write(data)
+    print(f"saved: {filename}")
+
+
+def _save_directory(data, filename, src_host):
+    if not _confirm_accept(data, filename, 'directory', src_host):
+        return
+
+    name = filename
+
+    tmp = tempfile.NamedTemporaryFile(suffix='.tar', delete=False)
+    try:
+        tmp.write(data)
+        tmp.close()
+
+        extract_dir = tempfile.mkdtemp()
+        try:
+            subprocess.run(
+                ['tar', 'xf', tmp.name, '-C', extract_dir],
+                check=True, capture_output=True
+            )
+
+            items = os.listdir(extract_dir)
+            if not items:
+                print("  error: tar archive is empty", file=sys.stderr)
+                return
+
+            extracted = os.path.join(extract_dir, items[0])
+            if os.path.exists(name):
+                action, name = _handle_conflict(filename)
+                if action == 'reject':
+                    return
+            if os.path.exists(name):
+                if os.path.isdir(name):
+                    shutil.rmtree(name)
+                else:
+                    os.unlink(name)
+            shutil.move(extracted, name)
+            print(f"saved: {name}/")
+        finally:
+            shutil.rmtree(extract_dir, ignore_errors=True)
+    finally:
+        os.unlink(tmp.name)
+
+
+def send_push(path, host, port):
+    """Push a file/dir to a receiving server (current 'send' behavior)."""
     path = os.path.abspath(path)
     if not os.path.exists(path):
         print(f"error: {path}: no such file or directory", file=sys.stderr)
@@ -64,6 +208,83 @@ def send(path, host, port):
         sys.exit(1)
 
 
+class FileServeHandler(http.server.BaseHTTPRequestHandler):
+    """Serves a file/dir via HTTP GET for pull mode (sender listens)."""
+    filepath = None
+
+    def do_GET(self):
+        addr = self.client_address[0]
+        name = os.path.basename(self.filepath)
+        filetype = 'directory' if os.path.isdir(self.filepath) else 'file'
+        print(f"\nconnection from {addr} requesting: {name} ({filetype})")
+        try:
+            answer = input(f"Send '{name}' to {addr}? [y/N]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\nrejected")
+            self.send_response(403)
+            self.end_headers()
+            return
+        if answer not in ('y', 'yes'):
+            print(f"rejected ({addr})")
+            self.send_response(403)
+            self.end_headers()
+            return
+
+        filepath = self.filepath
+        is_dir = os.path.isdir(filepath)
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/octet-stream')
+        self.send_header('X-Filename', name)
+        self.send_header('X-FileType', filetype)
+        try:
+            if is_dir:
+                data = subprocess.run(
+                    ['tar', 'cf', '-', '-C', os.path.dirname(filepath), name],
+                    check=True, capture_output=True
+                ).stdout
+                self.send_header('Content-Length', len(data))
+                self.end_headers()
+                self.wfile.write(data)
+            else:
+                fsize = os.path.getsize(filepath)
+                self.send_header('Content-Length', fsize)
+                self.end_headers()
+                with open(filepath, 'rb') as f:
+                    shutil.copyfileobj(f, self.wfile)
+        except (BrokenPipeError, ConnectionResetError):
+            print(f"  connection lost ({addr})")
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+def send_listen(path, port):
+    """Listen for a receiver to pull a file/dir."""
+    path = os.path.abspath(path)
+    if not os.path.exists(path):
+        print(f"error: {path}: no such file or directory", file=sys.stderr)
+        sys.exit(1)
+
+    FileServeHandler.filepath = path
+    server = socketserver.TCPServer(('0.0.0.0', port), FileServeHandler)
+    server.allow_reuse_address = True
+    name = os.path.basename(path)
+    filetype = 'directory' if os.path.isdir(path) else 'file'
+    print(f"pysend send listening on http://0.0.0.0:{port}")
+    print(f"offering: {name} ({filetype})")
+    print(f"receive with: pysend receive --host <this_ip> --port {port}")
+    print()
+    try:
+        server.handle_request()
+        print(f"sent: {path}")
+    except KeyboardInterrupt:
+        print("\ncancelled")
+        sys.exit(1)
+    except Exception as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
 class UploadHandler(http.server.BaseHTTPRequestHandler):
     """HTTP handler that receives file uploads with interactive naming."""
 
@@ -99,152 +320,11 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
         src_host = self.client_address[0]
         try:
             if filetype == 'directory':
-                self._save_directory(data, filename, src_host)
+                _save_directory(data, filename, src_host)
             else:
-                self._save_file(data, filename, src_host)
+                _save_file(data, filename, src_host)
         except Exception as e:
             print(f"  error processing upload from {src_host}: {e}")
-
-    def _save_file(self, data, filename, src_host):
-        if not self._confirm_accept(data, filename, 'file', src_host):
-            return
-        if os.path.exists(filename):
-            action, name = self._handle_conflict(filename)
-            if action == 'reject':
-                return
-            if action == 'rename':
-                filename = name
-        else:
-            name = filename
-        with open(name, 'wb') as f:
-            f.write(data)
-        print(f"saved: {name}")
-
-    def _save_directory(self, data, filename, src_host):
-        if not self._confirm_accept(data, filename, 'directory', src_host):
-            return
-
-        name = filename
-
-        tmp = tempfile.NamedTemporaryFile(suffix='.tar', delete=False)
-        try:
-            tmp.write(data)
-            tmp.close()
-
-            extract_dir = tempfile.mkdtemp()
-            try:
-                subprocess.run(
-                    ['tar', 'xf', tmp.name, '-C', extract_dir],
-                    check=True, capture_output=True
-                )
-
-                items = os.listdir(extract_dir)
-                if not items:
-                    print("  error: tar archive is empty", file=sys.stderr)
-                    return
-
-                extracted = os.path.join(extract_dir, items[0])
-                if os.path.exists(name):
-                    action, name = self._handle_conflict(filename)
-                    if action == 'reject':
-                        return
-                if os.path.exists(name):
-                    if os.path.isdir(name):
-                        shutil.rmtree(name)
-                    else:
-                        os.unlink(name)
-                shutil.move(extracted, name)
-                print(f"saved: {name}/")
-            finally:
-                shutil.rmtree(extract_dir, ignore_errors=True)
-        finally:
-            os.unlink(tmp.name)
-
-    def _show_diff(self, data, filename, filetype, brief=True):
-        if not os.path.exists(filename):
-            print(f"  (no local '{filename}' to compare)")
-            return
-        tmp_data = None
-        tmp_dir = None
-        try:
-            if filetype == 'directory':
-                tmp = tempfile.NamedTemporaryFile(suffix='.tar', delete=False)
-                tmp.write(data)
-                tmp.close()
-                tmp_dir = tempfile.mkdtemp()
-                subprocess.run(['tar', 'xf', tmp.name, '-C', tmp_dir],
-                           check=True, capture_output=True)
-                os.unlink(tmp.name)
-                items = os.listdir(tmp_dir)
-                if items:
-                    src = os.path.join(tmp_dir, items[0])
-                    incoming = os.path.join(tmp_dir, 'incoming')
-                    os.rename(src, incoming)
-                    subprocess.run(['diff', '-rq', filename, incoming] if brief
-                               else ['diff', '-r', filename, incoming])
-                else:
-                    print("  (empty archive)")
-            else:
-                tmp_data = tempfile.NamedTemporaryFile(delete=False)
-                tmp_data.write(data)
-                tmp_data.close()
-                subprocess.run(['diff', '-q', filename, tmp_data.name] if brief
-                           else ['diff', filename, tmp_data.name])
-        finally:
-            if tmp_data:
-                os.unlink(tmp_data.name)
-            if tmp_dir:
-                shutil.rmtree(tmp_dir, ignore_errors=True)
-
-    def _confirm_accept(self, data, filename, filetype, src_host):
-        print(f"received from {src_host}: {filename}")
-        while True:
-            try:
-                answer = input(f"Accept '{filename}' from {src_host}? [y/N/diff/!diff]: ").strip().lower()
-            except (EOFError, KeyboardInterrupt):
-                print()
-                return False
-            if answer in ('y', 'yes'):
-                return True
-            if answer in ('', 'n', 'no'):
-                print(f"  rejected ({filename})")
-                return False
-            if answer == 'diff':
-                self._show_diff(data, filename, filetype, brief=True)
-                continue
-            if answer == '!diff':
-                self._show_diff(data, filename, filetype, brief=False)
-                continue
-            print("  y = accept, N = reject, diff = summary, !diff = full diff")
-
-    def _handle_conflict(self, filename):
-        print(f"  '{filename}' already exists")
-        while True:
-            try:
-                answer = input(f"Overwrite '{filename}'? [y/N]: ").strip().lower()
-            except (EOFError, KeyboardInterrupt):
-                print()
-                return 'reject', None
-            if answer in ('y', 'yes'):
-                return 'overwrite', filename
-            if answer in ('', 'n', 'no'):
-                break
-        while True:
-            try:
-                answer = rlinput("Rename: ", filename).strip()
-            except (EOFError, KeyboardInterrupt):
-                print()
-                return 'reject', None
-            if not answer:
-                print("  name can't be empty")
-                continue
-            if answer == filename:
-                print("  name unchanged, choose another")
-                continue
-            if os.path.exists(answer):
-                print(f"  '{answer}' already exists")
-                continue
-            return 'rename', answer
 
     def log_message(self, fmt, *args):
         pass
@@ -254,15 +334,15 @@ class ReusableTCPServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
 
 
-def receive(port, tmpdir):
-    """Start the receiving HTTP server."""
+def receive_listen(port, tmpdir):
+    """Listen for incoming pushes (current 'receive' behavior)."""
     host = '0.0.0.0'
     os.makedirs(tmpdir, exist_ok=True)
     tempfile.tempdir = os.path.abspath(tmpdir)
     server = ReusableTCPServer((host, port), UploadHandler)
     print(f"pysend receive listening on http://{host}:{port}")
     print(f"temp dir: {tempfile.tempdir}")
-    print("send files:  pysend send <file|dir>")
+    print("send files:  pysend send <file|dir> --host <this_ip>")
     print()
     try:
         server.serve_forever()
@@ -271,25 +351,57 @@ def receive(port, tmpdir):
         server.shutdown()
 
 
+def receive_pull(host, port, tmpdir):
+    """Connect to a sender and pull a file/dir."""
+    url = f'http://{host}:{port}/'
+    try:
+        with urllib.request.urlopen(url, timeout=30) as resp:
+            filename = resp.headers.get('X-Filename')
+            filetype = resp.headers.get('X-FileType', 'file')
+            data = resp.read()
+    except urllib.error.URLError as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if not filename:
+        print("error: no filename in server response", file=sys.stderr)
+        sys.exit(1)
+
+    filename = os.path.basename(filename)
+    os.makedirs(tmpdir, exist_ok=True)
+    tempfile.tempdir = os.path.abspath(tmpdir)
+
+    if filetype == 'directory':
+        _save_directory(data, filename, host)
+    else:
+        _save_file(data, filename, host)
+
+
 def main():
     parser = argparse.ArgumentParser(description='pysend - transfer files over HTTP')
     parser.add_argument('action', choices=['send', 'receive'])
     parser.add_argument('path', nargs='?', help='file or directory to send')
     parser.add_argument('--port', type=int, default=int(os.environ.get('PYSEND_PORT', '8001')),
                         help='port (env: PYSEND_PORT, default: 8001)')
-    parser.add_argument('--host', default=os.environ.get('PYSEND_HOST', 'localhost'),
-                        help='server host for send (env: PYSEND_HOST, default: localhost)')
+    parser.add_argument('--host', default=os.environ.get('PYSEND_HOST'),
+                        help='server host for send/pull receive (env: PYSEND_HOST)')
     parser.add_argument('--tmpdir', default=os.environ.get('PYSEND_TMPDIR', '.tmp'),
                         help='temp dir for receive (env: PYSEND_TMPDIR, default: .tmp)')
     args = parser.parse_args()
 
-    if args.action == 'receive':
-        receive(args.port, args.tmpdir)
-    elif args.action == 'send':
+    if args.action == 'send':
         if not args.path:
             print("error: path required for 'send'", file=sys.stderr)
             sys.exit(1)
-        send(args.path, args.host, args.port)
+        if args.host:
+            send_push(args.path, args.host, args.port)
+        else:
+            send_listen(args.path, args.port)
+    elif args.action == 'receive':
+        if args.host:
+            receive_pull(args.host, args.port, args.tmpdir)
+        else:
+            receive_listen(args.port, args.tmpdir)
 
 
 if __name__ == '__main__':
